@@ -5,7 +5,9 @@
     "description": "Adds a themed emoji to the beginning of every channel name in a server. Supports holiday presets for Christmas and Halloween, or custom emoji input. Also includes a cleanup command to remove emoji prefixes.",
     "install_msg": "Thanks for installing Emojify! Use `[p]help emojify` to get started.",
     "end_user_data_statement": "This cog does not persistently store or process user data.",
-    "requirements": [],
+    "requirements": [
+        "regex"
+    ],
     "tags": [
         "channels",
         "emoji",
