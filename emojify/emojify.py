@@ -24,14 +24,15 @@ class Emojify(commands.Cog):
         if not text:
             return text
 
-        match = regex.match(r"^\X", text)
+        match = regex.match(r"^(\X)(.*)$", text)
 
         if not match:
             return text
 
-        first = match.group()
+        first = match.group(1)
 
-        if self._is_emoji(first):
+        # If the first grapheme contains an emoji codepoint
+        if regex.search(r"\p{Emoji}", first):
             return text[len(first):]
 
         return text
