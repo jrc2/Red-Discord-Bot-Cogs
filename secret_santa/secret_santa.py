@@ -12,19 +12,8 @@ log = logging.getLogger("red.cog.secret_santa")
 
 IDENTIFIER = 8472916358274916
 
-# Constants for event ID generation
-EVENT_ID_LENGTH = 8
-MAX_EVENT_ID_RETRIES = 100
-
 # Discord embed field character limit
 EMBED_FIELD_MAX_LENGTH = 1024
-
-
-def generate_event_id() -> str:
-    """Generate a random alphanumeric event ID."""
-    alphabet = string.ascii_uppercase + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(EVENT_ID_LENGTH))
-
 
 class SecretSanta(commands.Cog):
     """Manage Secret Santa events for your server."""
@@ -77,16 +66,6 @@ class SecretSanta(commands.Cog):
             return None
 
         return (guild_id, event_name, events[event_name])
-
-    async def _generate_unique_event_id(self) -> str:
-        """Generate a unique event ID that doesn't conflict with existing ones."""
-        event_lookup = await self.config.event_lookup()
-        for _ in range(MAX_EVENT_ID_RETRIES):
-            event_id = generate_event_id()
-            if event_id not in event_lookup:
-                return event_id
-        # Fallback: use a longer ID
-        return generate_event_id() + generate_event_id()
 
     @commands.hybrid_group()
     @commands.guild_only()
