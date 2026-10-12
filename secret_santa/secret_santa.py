@@ -99,6 +99,7 @@ class SecretSanta(commands.Cog):
         self,
         ctx,
         event_name: str,
+        event_id: str,
         target_date: str,
         max_price: str,
         participants: commands.Greedy[discord.Member]
@@ -107,6 +108,7 @@ class SecretSanta(commands.Cog):
 
         Parameters:
         - event_name: A unique name for this event
+        - event_id: The unique ID for the event (no spaces). Try to keep it short because it's used for DMs
         - target_date: The target date (YYYY-MM-DD format)
         - max_price: Maximum gift price (e.g., "$25" or "25 USD")
         - participants: Mention all participants (at least 2 required)
@@ -140,8 +142,11 @@ class SecretSanta(commands.Cog):
             )
             return
 
-        # Generate unique event ID for DM-based messaging
-        event_id = await self._generate_unique_event_id()
+        # Validate event ID is unique
+        event_lookup = await self.config.event_lookup()
+        if event_id in event_lookup:
+            await ctx.send("Event ID already exists. Retry with a unique ID.")
+            return
 
         # Create participant data
         participant_data = {}
@@ -160,6 +165,8 @@ class SecretSanta(commands.Cog):
             "target_date": target_date,
             "max_price": max_price,
             "participants": participant_data,
+            "blocked_pairings": [],
+            "family_groups": [],
             "created_by": ctx.author.id,
             "created_at": datetime.datetime.now().isoformat(),
             "matched": False,
@@ -238,6 +245,7 @@ class SecretSanta(commands.Cog):
         self,
         ctx,
         event_name: str,
+        event_id: str,
         target_date: str,
         max_price: str,
         pairings: Optional[str] = None
@@ -248,6 +256,8 @@ class SecretSanta(commands.Cog):
         ----------
         event_name : str
             A unique name for this event
+        event_id : str 
+            The unique ID for the event (no spaces). Try to keep it short because it's used for DMs
         target_date : str
             The target date (YYYY-MM-DD format)
         max_price : str
@@ -342,8 +352,11 @@ class SecretSanta(commands.Cog):
         for giver_id, receiver_id in parsed_pairings:
             participant_data[str(giver_id)]["matched_to"] = receiver_id
 
-        # Generate unique event ID for DM-based messaging
-        event_id = await self._generate_unique_event_id()
+        # Validate event ID is unique
+        event_lookup = await self.config.event_lookup()
+        if event_id in event_lookup:
+            await ctx.send("Event ID already exists. Retry with a unique ID.")
+            return
 
         # Create the event
         event = {
@@ -352,9 +365,11 @@ class SecretSanta(commands.Cog):
             "target_date": target_date,
             "max_price": max_price,
             "participants": participant_data,
+            "blocked_pairings": [],
+            "family_groups": [],
             "created_by": ctx.author.id,
             "created_at": datetime.datetime.now().isoformat(),
-            "matched": True,  # Already matched since we imported pairings
+            "matched": True,
         }
 
         async with self.config.guild(ctx.guild).events() as events:
@@ -455,7 +470,11 @@ class SecretSanta(commands.Cog):
             return
 
         # Generate random pairings (each person gives to one person)
-        pairings = self._generate_pairings([int(p) for p in participants])
+        pairings = self._generate_pairings(
+            [int(p) for p in participants],
+            event.get("blocked_pairings", []),
+            event.get("family_groups", []),
+        )
         if not pairings:
             await ctx.send("Failed to generate valid pairings. Please try again.")
             return
@@ -574,19 +593,305 @@ class SecretSanta(commands.Cog):
             f"Use `{ctx.prefix}santa match {event_name}` to create new pairings."
         )
 
-    def _generate_pairings(self, participants: List[int]) -> Optional[List[tuple]]:
-        """Generate random pairings where no one is matched to themselves."""
-        # Use derangement algorithm
-        shuffled = participants.copy()
-        max_attempts = 100
+    def _generate_pairings(
+        self,
+        participants: List[int],
+        blocked_pairings: List[list] = None,
+        family_groups: List[list] = None,
+    ) -> Optional[List[tuple]]:
+        """
+        Generate Secret Santa matches while respecting
+        directional pair restrictions and family groups.
+        """
+
+        blocked_pairings = blocked_pairings or []
+        family_groups = family_groups or []
+
+        blocked_lookup = {
+            (giver, receiver)
+            for giver, receiver in blocked_pairings
+        }
+
+        family_lookup = {}
+
+        for group in family_groups:
+            members = set(group)
+
+            for member in members:
+                family_lookup.setdefault(
+                    member,
+                    set()
+                ).update(
+                    members - {member}
+                )
+
+        max_attempts = 5000
 
         for _ in range(max_attempts):
+
+            shuffled = participants.copy()
             random.shuffle(shuffled)
-            # Check that no one is matched to themselves
-            if all(participants[i] != shuffled[i] for i in range(len(participants))):
-                return list(zip(participants, shuffled))
+
+            valid = True
+
+            for giver, receiver in zip(
+                participants,
+                shuffled
+            ):
+
+                if giver == receiver:
+                    valid = False
+                    break
+
+                if (giver, receiver) in blocked_lookup:
+                    valid = False
+                    break
+
+                if receiver in family_lookup.get(
+                    giver,
+                    set()
+                ):
+                    valid = False
+                    break
+
+            if valid:
+                return list(
+                    zip(participants, shuffled)
+                )
 
         return None
+
+    @santa.command(name="blockpair")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_blockpair(
+        self,
+        ctx,
+        event_name: str,
+        giver: discord.Member,
+        receiver: discord.Member,
+    ):
+        """Prevent one user from being assigned another user."""
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(f"Event `{event_name}` not found.")
+            return
+
+        restriction = [giver.id, receiver.id]
+
+        async with self.config.guild(ctx.guild).events() as events:
+            blocked = events[event_name].setdefault(
+                "blocked_pairings",
+                []
+            )
+
+            if restriction in blocked:
+                await ctx.send("That restriction already exists.")
+                return
+
+            blocked.append(restriction)
+
+        await ctx.send(
+            f"✅ {giver.display_name} cannot draw {receiver.display_name}."
+        )
+
+    @santa.command(name="unblockpair")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_unblockpair(
+        self,
+        ctx,
+        event_name: str,
+        giver: discord.Member,
+        receiver: discord.Member,
+    ):
+        """Remove a pairing restriction."""
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(f"Event `{event_name}` not found.")
+            return
+
+        restriction = [giver.id, receiver.id]
+
+        async with self.config.guild(ctx.guild).events() as events:
+            blocked = events[event_name].setdefault(
+                "blocked_pairings",
+                []
+            )
+
+            if restriction not in blocked:
+                await ctx.send("That restriction does not exist.")
+                return
+
+            blocked.remove(restriction)
+
+        await ctx.send(
+            f"✅ {giver.display_name} may now draw {receiver.display_name}."
+        )
+
+    @santa.command(name="pairings")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_pairings(
+        self,
+        ctx,
+        event_name: str,
+    ):
+        """List directional pairing restrictions."""
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(f"Event `{event_name}` not found.")
+            return
+
+        blocked = events[event_name].get(
+            "blocked_pairings",
+            []
+        )
+
+        if not blocked:
+            await ctx.send("No pairing restrictions configured.")
+            return
+
+        lines = []
+
+        for giver_id, receiver_id in blocked:
+            giver = ctx.guild.get_member(giver_id)
+            receiver = ctx.guild.get_member(receiver_id)
+
+            giver_name = giver.display_name if giver else str(giver_id)
+            receiver_name = receiver.display_name if receiver else str(receiver_id)
+
+            lines.append(f"• {giver_name} → {receiver_name}")
+
+        await ctx.send("\n".join(lines))
+
+    @santa.command(name="family")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_family(
+        self,
+        ctx,
+        event_name: str,
+        members: commands.Greedy[discord.Member]
+    ):
+        """
+        Add a household/family group.
+        Members in the same group cannot draw one another.
+        """
+
+        if len(members) < 2:
+            await ctx.send(
+                "You must specify at least two members."
+            )
+            return
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(f"Event `{event_name}` not found.")
+            return
+
+        group = list({m.id for m in members})
+
+        async with self.config.guild(ctx.guild).events() as events:
+            family_groups = events[event_name].setdefault(
+                "family_groups",
+                []
+            )
+
+            family_groups.append(group)
+
+        names = ", ".join(
+            member.display_name
+            for member in members
+        )
+
+        await ctx.send(
+            f"✅ Added family group: {names}"
+        )
+
+    @santa.command(name="families")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_families(
+        self,
+        ctx,
+        event_name: str
+    ):
+        """Show family groups."""
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(f"Event `{event_name}` not found.")
+            return
+
+        groups = events[event_name].get(
+            "family_groups",
+            []
+        )
+
+        if not groups:
+            await ctx.send(
+                "No family groups configured."
+            )
+            return
+
+        lines = []
+
+        for idx, group in enumerate(groups, start=1):
+            names = []
+
+            for uid in group:
+                member = ctx.guild.get_member(uid)
+
+                if member:
+                    names.append(member.display_name)
+                else:
+                    names.append(str(uid))
+
+            lines.append(
+                f"{idx}. {', '.join(names)}"
+            )
+
+        await ctx.send("\n".join(lines))
+
+    @santa.command(name="removefamily")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def santa_removefamily(
+        self,
+        ctx,
+        event_name: str,
+        index: int
+    ):
+        """Remove a family group."""
+
+        events = await self.config.guild(ctx.guild).events()
+
+        if event_name not in events:
+            await ctx.send(
+                f"Event `{event_name}` not found."
+            )
+            return
+
+        async with self.config.guild(ctx.guild).events() as events:
+            groups = events[event_name].get(
+                "family_groups",
+                []
+            )
+
+            if index < 1 or index > len(groups):
+                await ctx.send(
+                    "Invalid family group number."
+                )
+                return
+
+            groups.pop(index - 1)
+
+        await ctx.send(
+            f"✅ Removed family group #{index}"
+        )
 
     @santa.command(name="message")
     async def santa_message(self, ctx, event_name: str, *, message: str):

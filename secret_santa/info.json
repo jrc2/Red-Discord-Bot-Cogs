@@ -1,6 +1,6 @@
 {
     "name": "SecretSanta",
-    "author": ["psykzz"],
+    "author": ["psykzz", "jrc2"],
     "short": "Manage Secret Santa events",
     "description": "A cog to manage Secret Santa events. Create events with target dates, max prices, and participants. Automatically match participants, allow anonymous messaging between pairs, and track gift sending/receiving status.",
     "tags": ["secret santa", "christmas", "gift", "event", "holiday"],
