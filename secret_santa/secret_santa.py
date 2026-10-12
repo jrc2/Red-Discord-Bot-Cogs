@@ -1,9 +1,7 @@
 import datetime
 import logging
 import random
-import secrets
-import string
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import discord
 from redbot.core import Config, checks, commands
@@ -23,49 +21,50 @@ class SecretSanta(commands.Cog):
         self.config = Config.get_conf(self, identifier=IDENTIFIER)
 
         default_guild = {
-            "events": {},  # event_name -> event data
-        }
-        default_global = {
-            "event_lookup": {},  # event_id -> {"guild_id": int, "event_name": str}
+            "event": None,
         }
         self.config.register_guild(**default_guild)
-        self.config.register_global(**default_global)
+
+    async def _get_event(self, guild):
+        return await self.config.guild(guild).event()
+
+    async def _get_user_event(self, user_id: int):
+        all_guilds = await self.config.all_guilds()
+
+        for guild_id, guild_data in all_guilds.items():
+            event = guild_data.get("event")
+
+            if not event:
+                continue
+
+            if str(user_id) in event.get("participants", {}):
+                return guild_id, event
+
+        return None
+
+    async def _save_event(self, guild_or_id, event):
+        if isinstance(guild_or_id, int):
+            await self.config.guild_from_id(guild_or_id).event.set(event)
+        else:
+            await self.config.guild(guild_or_id).event.set(event)
 
     async def red_delete_data_for_user(self, *, requester, user_id: int):
         """Delete user data when requested."""
+
         all_guilds = await self.config.all_guilds()
+
         for guild_id, guild_data in all_guilds.items():
-            events = guild_data.get("events", {})
-            modified = False
-            for event_name, event in events.items():
-                participants = event.get("participants", {})
-                user_id_str = str(user_id)
-                if user_id_str in participants:
-                    del events[event_name]["participants"][user_id_str]
-                    modified = True
-            if modified:
-                await self.config.guild_from_id(guild_id).events.set(events)
 
-    async def _lookup_event_by_id(
-        self, event_id: str
-    ) -> Optional[Tuple[int, str, dict]]:
-        """Look up an event by its unique event ID.
+            event = guild_data.get("event")
 
-        Returns (guild_id, event_name, event_data) or None if not found.
-        """
-        event_lookup = await self.config.event_lookup()
-        if event_id not in event_lookup:
-            return None
+            if not event:
+                continue
 
-        lookup_data = event_lookup[event_id]
-        guild_id = lookup_data["guild_id"]
-        event_name = lookup_data["event_name"]
+            user_id_str = str(user_id)
 
-        events = await self.config.guild_from_id(guild_id).events()
-        if event_name not in events:
-            return None
-
-        return (guild_id, event_name, events[event_name])
+            if user_id_str in event["participants"]:
+                del event["participants"][user_id_str]
+                await self.config.guild_from_id(guild_id).event.set(event)
 
     @commands.hybrid_group()
     @commands.guild_only()
@@ -78,7 +77,6 @@ class SecretSanta(commands.Cog):
         self,
         ctx,
         event_name: str,
-        event_id: str,
         target_date: str,
         max_price: str,
         participants: commands.Greedy[discord.Member]
@@ -87,7 +85,6 @@ class SecretSanta(commands.Cog):
 
         Parameters:
         - event_name: A unique name for this event
-        - event_id: The unique ID for the event (no spaces). Try to keep it short because it's used for DMs
         - target_date: The target date (YYYY-MM-DD format)
         - max_price: Maximum gift price (e.g., "$25" or "25 USD")
         - participants: Mention all participants (at least 2 required)
@@ -112,20 +109,13 @@ class SecretSanta(commands.Cog):
             await ctx.send("Duplicate participants detected. Each person can only participate once.")
             return
 
-        # Check if event already exists
-        events = await self.config.guild(ctx.guild).events()
-        if event_name in events:
-            await ctx.send(
-                f"An event named `{event_name}` already exists. "
-                "Use a different name or delete the existing event."
-            )
-            return
+        # Check if an event already exists
+        current_event = await self._get_event(ctx.guild)
 
-        # Validate event ID is unique
-        event_id = event_id.upper()
-        event_lookup = await self.config.event_lookup()
-        if event_id in event_lookup:
-            await ctx.send("Event ID already exists. Retry with a unique ID.")
+        if current_event:
+            await ctx.send(
+                "A Secret Santa event already exists. Delete it first."
+            )
             return
 
         # Create participant data
@@ -141,7 +131,6 @@ class SecretSanta(commands.Cog):
         # Create the event
         event = {
             "name": event_name,
-            "event_id": event_id,
             "target_date": target_date,
             "max_price": max_price,
             "participants": participant_data,
@@ -152,15 +141,7 @@ class SecretSanta(commands.Cog):
             "matched": False,
         }
 
-        async with self.config.guild(ctx.guild).events() as events:
-            events[event_name] = event
-
-        # Register the event ID in the global lookup
-        async with self.config.event_lookup() as lookup:
-            lookup[event_id] = {
-                "guild_id": ctx.guild.id,
-                "event_name": event_name,
-            }
+        await self._save_event(ctx.guild, event)
 
         # Send DMs to participants asking for their wishlist
         dm_success = 0
@@ -176,13 +157,12 @@ class SecretSanta(commands.Cog):
                 )
                 embed.add_field(name="Target Date", value=parsed_date.strftime("%B %d, %Y"), inline=True)
                 embed.add_field(name="Max Price", value=max_price, inline=True)
-                embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
                 embed.add_field(
                     name="📝 Set Your Wishlist",
                     value=(
                         f"Please set your wishlist so your Secret Santa knows what you'd like!\n"
-                        f"DM me: `{ctx.prefix}santadm wishlist {event_id} <your wishlist>`\n\n"
-                        f"Example: `{ctx.prefix}santadm wishlist {event_id} "
+                        f"DM me: `{ctx.prefix}santadm wishlist <your wishlist>`\n\n"
+                        f"Example: `{ctx.prefix}santadm wishlist "
                         f"I'd love a book, some chocolates, or a cozy sweater!`"
                     ),
                     inline=False
@@ -191,7 +171,7 @@ class SecretSanta(commands.Cog):
                     name="💬 Anonymous Messaging",
                     value=(
                         f"After matching, you can send anonymous messages via DM!\n"
-                        f"`{ctx.prefix}santadm message {event_id} <your message>`"
+                        f"`{ctx.prefix}santadm message <your message>`"
                     ),
                     inline=False
                 )
@@ -207,7 +187,6 @@ class SecretSanta(commands.Cog):
             description=f"Event **{event_name}** has been created.",
             color=discord.Color.red()
         )
-        embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
         embed.add_field(name="Target Date", value=parsed_date.strftime("%B %d, %Y"), inline=True)
         embed.add_field(name="Max Price", value=max_price, inline=True)
         embed.add_field(name="Participants", value=f"{len(participants)} people", inline=True)
@@ -225,7 +204,6 @@ class SecretSanta(commands.Cog):
         self,
         ctx,
         event_name: str,
-        event_id: str,
         target_date: str,
         max_price: str,
         pairings: Optional[str] = None
@@ -236,8 +214,6 @@ class SecretSanta(commands.Cog):
         ----------
         event_name : str
             A unique name for this event
-        event_id : str 
-            The unique ID for the event (no spaces). Try to keep it short because it's used for DMs
         target_date : str
             The target date (YYYY-MM-DD format)
         max_price : str
@@ -266,11 +242,10 @@ class SecretSanta(commands.Cog):
             return
 
         # Check if event already exists
-        events = await self.config.guild(ctx.guild).events()
-        if event_name in events:
+        current_event = await self._get_event(ctx.guild)
+        if current_event:
             await ctx.send(
-                f"An event named `{event_name}` already exists. "
-                "Use a different name or delete the existing event."
+                "A Secret Santa event already exists. Delete it first."
             )
             return
 
@@ -332,17 +307,9 @@ class SecretSanta(commands.Cog):
         for giver_id, receiver_id in parsed_pairings:
             participant_data[str(giver_id)]["matched_to"] = receiver_id
 
-        # Validate event ID is unique
-        event_id = event_id.upper()
-        event_lookup = await self.config.event_lookup()
-        if event_id in event_lookup:
-            await ctx.send("Event ID already exists. Retry with a unique ID.")
-            return
-
         # Create the event
         event = {
             "name": event_name,
-            "event_id": event_id,
             "target_date": target_date,
             "max_price": max_price,
             "participants": participant_data,
@@ -353,15 +320,7 @@ class SecretSanta(commands.Cog):
             "matched": True,
         }
 
-        async with self.config.guild(ctx.guild).events() as events:
-            events[event_name] = event
-
-        # Register the event ID in the global lookup
-        async with self.config.event_lookup() as lookup:
-            lookup[event_id] = {
-                "guild_id": ctx.guild.id,
-                "event_name": event_name,
-            }
+        await self._save_event(ctx.guild, event)
 
         # Send DMs to participants with their match info and ask for wishlist
         dm_success = 0
@@ -379,12 +338,11 @@ class SecretSanta(commands.Cog):
                     embed.add_field(name="Your Giftee", value=receiver.display_name, inline=True)
                     embed.add_field(name="Max Price", value=max_price, inline=True)
                     embed.add_field(name="Target Date", value=parsed_date.strftime("%B %d, %Y"), inline=True)
-                    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
                     embed.add_field(
                         name="📝 Set Your Wishlist",
                         value=(
                             f"Set your wishlist so your Santa knows what you'd like!\n"
-                            f"DM me: `{ctx.prefix}santadm wishlist {event_id} <your wishlist>`"
+                            f"DM me: `{ctx.prefix}santadm wishlist <your wishlist>`"
                         ),
                         inline=False
                     )
@@ -392,9 +350,9 @@ class SecretSanta(commands.Cog):
                         name="Anonymous Messaging",
                         value=(
                             f"Send anonymous messages to your giftee via DM:\n"
-                            f"`{ctx.prefix}santadm message {event_id} <your message>`\n\n"
+                            f"`{ctx.prefix}santadm message <your message>`\n\n"
                             f"Reply to your Santa via DM:\n"
-                            f"`{ctx.prefix}santadm reply {event_id} <your message>`"
+                            f"`{ctx.prefix}santadm reply <your message>`"
                         ),
                         inline=False
                     )
@@ -409,7 +367,6 @@ class SecretSanta(commands.Cog):
             description=f"Event **{event_name}** has been imported with {len(parsed_pairings)} pairings.",
             color=discord.Color.green()
         )
-        embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
         embed.add_field(name="Target Date", value=parsed_date.strftime("%B %d, %Y"), inline=True)
         embed.add_field(name="Max Price", value=max_price, inline=True)
         embed.add_field(name="Participants", value=f"{len(all_participants)} people", inline=True)
@@ -420,22 +377,23 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="match")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_match(self, ctx, event_name: str):
+    async def santa_match(self, ctx):
         """Match all participants in a Secret Santa event.
 
         This will randomly assign each participant to give a gift to another participant.
         Each person gives to exactly one person and receives from exactly one person.
 
-        Example: [p]santa match xmas2024
+        Example: [p]santa match
         """
-        events = await self.config.guild(ctx.guild).events()
+        event = await self._get_event(ctx.guild)
 
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
 
-        event = events[event_name]
-        event_id = event.get("event_id")
+        event_name = event["name"]
 
         if event["matched"]:
             await ctx.send(
@@ -461,14 +419,13 @@ class SecretSanta(commands.Cog):
             return
 
         # Update participant data with pairings
-        async with self.config.guild(ctx.guild).events() as events:
-            for giver_id, receiver_id in pairings:
-                events[event_name]["participants"][str(giver_id)]["matched_to"] = receiver_id
-            events[event_name]["matched"] = True
+        for giver_id, receiver_id in pairings:
+            event["participants"][str(giver_id)]["matched_to"] = receiver_id
+        event["matched"] = True
+        await self._save_event(ctx.guild, event)
 
         # Reload event data to get wishlists
-        events = await self.config.guild(ctx.guild).events()
-        event = events[event_name]
+        event = await self._get_event(ctx.guild)
 
         # Send DMs to participants
         success_count = 0
@@ -489,8 +446,6 @@ class SecretSanta(commands.Cog):
                     embed.add_field(name="Your Giftee", value=receiver.display_name, inline=True)
                     embed.add_field(name="Max Price", value=event["max_price"], inline=True)
                     embed.add_field(name="Target Date", value=event["target_date"], inline=True)
-                    if event_id:
-                        embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
 
                     # Include the giftee's wishlist if available
                     if receiver_wishlist:
@@ -506,26 +461,16 @@ class SecretSanta(commands.Cog):
                             inline=False
                         )
 
-                    if event_id:
-                        embed.add_field(
-                            name="Anonymous Messaging (via DM)",
-                            value=(
-                                f"Send anonymous messages to your giftee:\n"
-                                f"`{ctx.prefix}santadm message {event_id} <your message>`\n\n"
-                                f"Reply to your Santa:\n"
-                                f"`{ctx.prefix}santadm reply {event_id} <your message>`"
-                            ),
-                            inline=False
-                        )
-                    else:
-                        embed.add_field(
-                            name="Anonymous Messaging",
-                            value=(
-                                f"Use `{ctx.prefix}santa message {event_name} <your message>` "
-                                "in the server to send an anonymous message to your giftee!"
-                            ),
-                            inline=False
-                        )
+                    embed.add_field(
+                        name="Anonymous Messaging (via DM)",
+                        value=(
+                            f"Send anonymous messages to your giftee:\n"
+                            f"`{ctx.prefix}santadm message <your message>`\n\n"
+                            f"Reply to your Santa:\n"
+                            f"`{ctx.prefix}santadm reply <your message>`"
+                        ),
+                        inline=False
+                    )
                     embed.set_footer(text="Remember to keep it a secret! 🤫")
                     await giver.send(embed=embed)
                     success_count += 1
@@ -539,8 +484,6 @@ class SecretSanta(commands.Cog):
         )
         embed.add_field(name="DMs Sent", value=str(success_count), inline=True)
         embed.add_field(name="DMs Failed", value=str(fail_count), inline=True)
-        if event_id:
-            embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
         if fail_count > 0:
             embed.set_footer(
                 text=f"Some users have DMs disabled. They can check their match with {ctx.prefix}santadm info"
@@ -550,28 +493,33 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="rematch")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_rematch(self, ctx, event_name: str):
+    async def santa_rematch(self, ctx):
         """Redo matching for a Secret Santa event.
 
         This will clear all existing pairings and create new random ones.
 
-        Example: [p]santa rematch xmas2024
+        Example: [p]santa rematch
         """
-        events = await self.config.guild(ctx.guild).events()
+        event = await self._get_event(ctx.guild)
 
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
 
+        event_name = event["name"]
+
         # Reset matched status
-        async with self.config.guild(ctx.guild).events() as events:
-            for user_id in events[event_name]["participants"]:
-                events[event_name]["participants"][user_id]["matched_to"] = None
-            events[event_name]["matched"] = False
+        for user_id in event["participants"]:
+            event["participants"][user_id]["matched_to"] = None
+
+        event["matched"] = False
+        await self._save_event(ctx.guild, event)
 
         await ctx.send(
             f"Pairings for `{event_name}` have been reset. "
-            f"Use `{ctx.prefix}santa match {event_name}` to create new pairings."
+            f"Use `{ctx.prefix}santa match` to create new pairings."
         )
 
     def _generate_pairings(
@@ -647,31 +595,32 @@ class SecretSanta(commands.Cog):
     async def santa_blockpair(
         self,
         ctx,
-        event_name: str,
         giver: discord.Member,
         receiver: discord.Member,
     ):
         """Prevent one user from being assigned another user."""
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
+        
         restriction = [giver.id, receiver.id]
 
-        async with self.config.guild(ctx.guild).events() as events:
-            blocked = events[event_name].setdefault(
-                "blocked_pairings",
-                []
-            )
+        blocked = event.setdefault(
+            "blocked_pairings",
+            []
+        )
 
-            if restriction in blocked:
-                await ctx.send("That restriction already exists.")
-                return
+        if restriction in blocked:
+            await ctx.send("That restriction already exists.")
+            return
 
-            blocked.append(restriction)
+        blocked.append(restriction)
+        await self._save_event(ctx.guild, event)
 
         await ctx.send(
             f"✅ {giver.display_name} cannot draw {receiver.display_name}."
@@ -682,31 +631,32 @@ class SecretSanta(commands.Cog):
     async def santa_unblockpair(
         self,
         ctx,
-        event_name: str,
         giver: discord.Member,
         receiver: discord.Member,
     ):
         """Remove a pairing restriction."""
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
+        
         restriction = [giver.id, receiver.id]
 
-        async with self.config.guild(ctx.guild).events() as events:
-            blocked = events[event_name].setdefault(
-                "blocked_pairings",
-                []
-            )
+        blocked = event.setdefault(
+            "blocked_pairings",
+            []
+        )
 
-            if restriction not in blocked:
-                await ctx.send("That restriction does not exist.")
-                return
+        if restriction not in blocked:
+            await ctx.send("That restriction does not exist.")
+            return
 
-            blocked.remove(restriction)
+        blocked.remove(restriction)
+        await self._save_event(ctx.guild, event)
 
         await ctx.send(
             f"✅ {giver.display_name} may now draw {receiver.display_name}."
@@ -717,17 +667,18 @@ class SecretSanta(commands.Cog):
     async def santa_pairings(
         self,
         ctx,
-        event_name: str,
     ):
         """List directional pairing restrictions."""
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
-        blocked = events[event_name].get(
+        
+        blocked = event.get(
             "blocked_pairings",
             []
         )
@@ -754,7 +705,6 @@ class SecretSanta(commands.Cog):
     async def santa_family(
         self,
         ctx,
-        event_name: str,
         members: commands.Greedy[discord.Member]
     ):
         """
@@ -767,22 +717,25 @@ class SecretSanta(commands.Cog):
                 "You must specify at least two members."
             )
             return
+        
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
+        
         group = list({m.id for m in members})
 
-        async with self.config.guild(ctx.guild).events() as events:
-            family_groups = events[event_name].setdefault(
-                "family_groups",
-                []
-            )
+        family_groups = event.setdefault(
+            "family_groups",
+            []
+        )
 
-            family_groups.append(group)
+        family_groups.append(group)
+        await self._save_event(ctx.guild, event)
 
         names = ", ".join(
             member.display_name
@@ -798,17 +751,18 @@ class SecretSanta(commands.Cog):
     async def santa_families(
         self,
         ctx,
-        event_name: str
     ):
         """Show family groups."""
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
-        groups = events[event_name].get(
+        
+        groups = event.get(
             "family_groups",
             []
         )
@@ -843,52 +797,53 @@ class SecretSanta(commands.Cog):
     async def santa_removefamily(
         self,
         ctx,
-        event_name: str,
         index: int
     ):
         """Remove a family group."""
 
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
             await ctx.send(
-                f"Event `{event_name}` not found."
+                "No Secret Santa event exists."
+            )
+            return
+        
+        groups = event.get(
+            "family_groups",
+            []
+        )
+
+        if index < 1 or index > len(groups):
+            await ctx.send(
+                "Invalid family group number."
             )
             return
 
-        async with self.config.guild(ctx.guild).events() as events:
-            groups = events[event_name].get(
-                "family_groups",
-                []
-            )
-
-            if index < 1 or index > len(groups):
-                await ctx.send(
-                    "Invalid family group number."
-                )
-                return
-
-            groups.pop(index - 1)
+        groups.pop(index - 1)
+        await self._save_event(ctx.guild, event)
 
         await ctx.send(
             f"✅ Removed family group #{index}"
         )
 
     @santa.command(name="message")
-    async def santa_message(self, ctx, event_name: str, *, message: str):
+    async def santa_message(self, ctx, *, message: str):
         """Send an anonymous message to your Secret Santa giftee.
 
         Your identity will be kept secret - the bot will relay the message.
 
-        Example: [p]santa message xmas2024 What's your favorite color?
+        Example: [p]santa message What's your favorite color?
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
-        event = events[event_name]
+        
+        event_name = event["name"]
 
         if not event["matched"]:
             await ctx.send("This event hasn't been matched yet. Ask an admin to run the matching.")
@@ -917,19 +872,11 @@ class SecretSanta(commands.Cog):
             )
             embed.add_field(name="Event", value=event_name, inline=True)
             embed.add_field(name="Server", value=ctx.guild.name, inline=True)
-            event_id = events[event_name].get("event_id")
-            if event_id:
-                embed.add_field(
-                    name="Reply",
-                    value=f"Reply anonymously via DM: `{ctx.prefix}santadm reply {event_id} <message>`",
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="Reply",
-                    value=f"Use `{ctx.prefix}santa reply {event_name} <message>` in the server to reply anonymously!",
-                    inline=False
-                )
+            embed.add_field(
+                name="Reply",
+                value=f"Reply anonymously via DM: `{ctx.prefix}santadm reply <message>`",
+                inline=False
+            )
             embed.set_footer(text="This is from your Secret Santa! 🎁")
             await recipient.send(embed=embed)
 
@@ -954,20 +901,22 @@ class SecretSanta(commands.Cog):
             await ctx.send("Could not send message to your giftee. They may have DMs disabled.")
 
     @santa.command(name="reply")
-    async def santa_reply(self, ctx, event_name: str, *, message: str):
+    async def santa_reply(self, ctx, *, message: str):
         """Send an anonymous reply to your Secret Santa (the person giving you a gift).
 
         This allows you to respond to questions from your Secret Santa.
 
-        Example: [p]santa reply xmas2024 My favorite color is blue!
+        Example: [p]santa reply My favorite color is blue!
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
-        event = events[event_name]
+        
+        event_name = event["name"]
 
         if not event["matched"]:
             await ctx.send("This event hasn't been matched yet.")
@@ -1022,62 +971,69 @@ class SecretSanta(commands.Cog):
             await ctx.send("Could not send reply to your Secret Santa. They may have DMs disabled.")
 
     @santa.command(name="sent")
-    async def santa_sent(self, ctx, event_name: str):
+    async def santa_sent(self, ctx):
         """Mark that you have sent your gift.
 
-        Example: [p]santa sent xmas2024
+        Example: [p]santa sent
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
+        
         user_id_str = str(ctx.author.id)
-        if user_id_str not in events[event_name]["participants"]:
+        if user_id_str not in event["participants"]:
             await ctx.send("You are not a participant in this event.")
             return
 
-        async with self.config.guild(ctx.guild).events() as events:
-            events[event_name]["participants"][user_id_str]["sent_gift"] = True
+        event["participants"][user_id_str]["sent_gift"] = True
+        await self._save_event(ctx.guild, event)
 
         await ctx.send("🎁 You've marked your gift as **sent**! Thank you!")
 
     @santa.command(name="received")
-    async def santa_received(self, ctx, event_name: str):
+    async def santa_received(self, ctx):
         """Mark that you have received your gift.
 
-        Example: [p]santa received xmas2024
+        Example: [p]santa received
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
+        
         user_id_str = str(ctx.author.id)
-        if user_id_str not in events[event_name]["participants"]:
+        if user_id_str not in event["participants"]:
             await ctx.send("You are not a participant in this event.")
             return
 
-        async with self.config.guild(ctx.guild).events() as events:
-            events[event_name]["participants"][user_id_str]["received_gift"] = True
+        event["participants"][user_id_str]["received_gift"] = True
+        await self._save_event(ctx.guild, event)
 
         await ctx.send("🎄 You've marked your gift as **received**! Enjoy your present!")
 
     @santa.command(name="whoami")
-    async def santa_whoami(self, ctx, event_name: str):
+    async def santa_whoami(self, ctx):
         """Check who you are matched to give a gift to (sent via DM).
 
-        Example: [p]santa whoami xmas2024
+        Example: [p]santa whoami
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
+        
+        event_name = event["name"]
 
-        event = events[event_name]
         user_id_str = str(ctx.author.id)
 
         if user_id_str not in event["participants"]:
@@ -1120,20 +1076,22 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="status")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_status(self, ctx, event_name: str):
+    async def santa_status(self, ctx):
         """Check the status of a Secret Santa event (admin only).
 
         Shows all participants and their gift status.
 
-        Example: [p]santa status xmas2024
+        Example: [p]santa status
         """
-        events = await self.config.guild(ctx.guild).events()
+        event = await self._get_event(ctx.guild)
 
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
 
-        event = events[event_name]
+        event_name = event["name"]
 
         embed = discord.Embed(
             title=f"🎅 Secret Santa Status: {event_name}",
@@ -1177,67 +1135,30 @@ class SecretSanta(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @santa.command(name="list")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def santa_list(self, ctx):
-        """List all Secret Santa events in this server.
-
-        Example: [p]santa list
-        """
-        events = await self.config.guild(ctx.guild).events()
-
-        if not events:
-            await ctx.send("No Secret Santa events found in this server.")
-            return
-
-        embed = discord.Embed(
-            title="🎅 Secret Santa Events",
-            color=discord.Color.red()
-        )
-
-        for event_name, event in events.items():
-            participant_count = len(event["participants"])
-            matched_status = "✅ Matched" if event["matched"] else "⏳ Not matched"
-            value = (
-                f"Date: {event['target_date']}\n"
-                f"Price: {event['max_price']}\n"
-                f"Participants: {participant_count}\n"
-                f"Status: {matched_status}"
-            )
-            embed.add_field(name=event_name, value=value, inline=True)
-
-        await ctx.send(embed=embed)
-
     @santa.command(name="delete")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_delete(self, ctx, event_name: str):
+    async def santa_delete(self, ctx):
         """Delete a Secret Santa event.
 
-        Example: [p]santa delete xmas2024
+        Example: [p]santa delete
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
 
-        # Get the event_id before deletion to clean up the lookup
-        event_id = events[event_name].get("event_id")
+        event_name = event["name"]
 
-        async with self.config.guild(ctx.guild).events() as events:
-            del events[event_name]
-
-        # Clean up the global event lookup
-        if event_id:
-            async with self.config.event_lookup() as lookup:
-                if event_id in lookup:
-                    del lookup[event_id]
+        await self.config.guild(ctx.guild).event.set(None)
 
         await ctx.send(f"🗑️ Event `{event_name}` has been deleted.")
 
     @santa.command(name="remind")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_remind(self, ctx, event_name: str):
+    async def santa_remind(self, ctx):
         """Send reminder DMs to all participants in a Secret Santa event.
 
         Reminds participants to:
@@ -1246,16 +1167,18 @@ class SecretSanta(commands.Cog):
         - Mark their gift as received (if not already)
         - Use anonymous DM messaging
 
-        Example: [p]santa remind xmas2024
+        Example: [p]santa remind
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
+        
+        event_name = event["name"]
 
-        event = events[event_name]
-        event_id = event.get("event_id")
         target_date = event.get("target_date", "Not specified")
         max_price = event.get("max_price", "Not specified")
 
@@ -1276,8 +1199,6 @@ class SecretSanta(commands.Cog):
                 )
                 embed.add_field(name="Target Date", value=target_date, inline=True)
                 embed.add_field(name="Max Price", value=max_price, inline=True)
-                if event_id:
-                    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
 
                 # Wishlist reminder
                 if participant_data.get("wishlist"):
@@ -1285,8 +1206,7 @@ class SecretSanta(commands.Cog):
                         name="📝 Your Wishlist",
                         value=(
                             f"You have a wishlist set! You can update it anytime.\n"
-                            f"DM me: `{ctx.prefix}santadm wishlist {event_id} <your wishlist>`"
-                            if event_id else "You have a wishlist set!"
+                            f"DM me: `{ctx.prefix}santadm wishlist <your wishlist>`"
                         ),
                         inline=False
                     )
@@ -1295,8 +1215,7 @@ class SecretSanta(commands.Cog):
                         name="📝 Set Your Wishlist",
                         value=(
                             f"You haven't set a wishlist yet! Help your Santa out.\n"
-                            f"DM me: `{ctx.prefix}santadm wishlist {event_id} <your wishlist>`"
-                            if event_id else "You haven't set a wishlist yet!"
+                            f"DM me: `{ctx.prefix}santadm wishlist <your wishlist>`"
                         ),
                         inline=False
                     )
@@ -1314,7 +1233,7 @@ class SecretSanta(commands.Cog):
                             name="🎁 Gift Sent",
                             value=(
                                 f"⏳ Don't forget to mark your gift as sent!\n"
-                                f"DM me: `{ctx.prefix}santadm sent {event_id}`"
+                                f"DM me: `{ctx.prefix}santadm sent`"
                             ),
                             inline=True
                         )
@@ -1331,21 +1250,21 @@ class SecretSanta(commands.Cog):
                             name="🎄 Gift Received",
                             value=(
                                 f"⏳ Remember to mark when you receive your gift!\n"
-                                f"DM me: `{ctx.prefix}santadm received {event_id}`"
+                                f"DM me: `{ctx.prefix}santadm received`"
                             ),
                             inline=True
                         )
 
-                # Anonymous messaging reminder (only if matched and event_id exists)
-                if event["matched"] and event_id:
+                # Anonymous messaging reminder (only if matched)
+                if event["matched"]:
                     embed.add_field(
                         name="💬 Anonymous Messaging",
                         value=(
                             f"You can send anonymous messages via DM!\n\n"
                             f"**Message your giftee:**\n"
-                            f"`{ctx.prefix}santadm message {event_id} <your message>`\n\n"
+                            f"`{ctx.prefix}santadm message <your message>`\n\n"
                             f"**Reply to your Santa:**\n"
-                            f"`{ctx.prefix}santadm reply {event_id} <your message>`"
+                            f"`{ctx.prefix}santadm reply <your message>`"
                         ),
                         inline=False
                     )
@@ -1370,25 +1289,27 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_add(self, ctx, event_name: str, members: commands.Greedy[discord.Member]):
+    async def santa_add(self, ctx, members: commands.Greedy[discord.Member]):
         """Add participants to an existing event (before matching).
 
         Parameters
         ----------
-        event_name : str
-            Name of the event
         members : commands.Greedy[discord.Member]
             Members to add to the event
 
-        Example: [p]santa add xmas2024 @user1 @user2
+        Example: [p]santa add @user1 @user2
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
+        
+        event_name = event["name"]
 
-        if events[event_name]["matched"]:
+        if event["matched"]:
             await ctx.send(
                 f"Cannot add participants after matching. Use `{ctx.prefix}santa rematch` to reset matching first."
             )
@@ -1398,8 +1319,6 @@ class SecretSanta(commands.Cog):
             await ctx.send("Please mention at least one member to add.")
             return
 
-        event = events[event_name]
-        event_id = event.get("event_id")
         max_price = event.get("max_price", "Not specified")
         target_date = event.get("target_date", "Not specified")
 
@@ -1407,20 +1326,20 @@ class SecretSanta(commands.Cog):
         already_in = []
         added_members = []
 
-        async with self.config.guild(ctx.guild).events() as events:
-            for member in members:
-                user_id_str = str(member.id)
-                if user_id_str in events[event_name]["participants"]:
-                    already_in.append(member.display_name)
-                else:
-                    events[event_name]["participants"][user_id_str] = {
-                        "matched_to": None,
-                        "sent_gift": False,
-                        "received_gift": False,
-                        "wishlist": None,
-                    }
-                    added.append(member.display_name)
-                    added_members.append(member)
+        for member in members:
+            user_id_str = str(member.id)
+            if user_id_str in event["participants"]:
+                already_in.append(member.display_name)
+            else:
+                event["participants"][user_id_str] = {
+                    "matched_to": None,
+                    "sent_gift": False,
+                    "received_gift": False,
+                    "wishlist": None,
+                }
+                added.append(member.display_name)
+                added_members.append(member)
+        await self._save_event(ctx.guild, event)
 
         # Send DMs to newly added members asking for their wishlist
         dm_success = 0
@@ -1436,29 +1355,24 @@ class SecretSanta(commands.Cog):
                 )
                 embed.add_field(name="Target Date", value=target_date, inline=True)
                 embed.add_field(name="Max Price", value=max_price, inline=True)
-                if event_id:
-                    embed.add_field(name="Event ID", value=f"`{event_id}`", inline=True)
                 embed.add_field(
                     name="📝 Set Your Wishlist",
                     value=(
                         f"Please set your wishlist so your Secret Santa knows what you'd like!\n"
-                        f"DM me: `{ctx.prefix}santadm wishlist {event_id} <your wishlist>`\n\n"
-                        f"Example: `{ctx.prefix}santadm wishlist {event_id} "
+                        f"DM me: `{ctx.prefix}santadm wishlist <your wishlist>`\n\n"
+                        f"Example: `{ctx.prefix}santadm wishlist "
                         f"I'd love a book, some chocolates, or a cozy sweater!`"
-                    ) if event_id else (
-                        "Please set your wishlist so your Secret Santa knows what you'd like!"
                     ),
                     inline=False
                 )
-                if event_id:
-                    embed.add_field(
-                        name="💬 Anonymous Messaging",
-                        value=(
-                            f"After matching, you can send anonymous messages via DM!\n"
-                            f"`{ctx.prefix}santadm message {event_id} <your message>`"
-                        ),
-                        inline=False
-                    )
+                embed.add_field(
+                    name="💬 Anonymous Messaging",
+                    value=(
+                        f"After matching, you can send anonymous messages via DM!\n"
+                        f"`{ctx.prefix}santadm message <your message>`"
+                    ),
+                    inline=False
+                )
                 embed.set_footer(text="Your wishlist will be shared with your Secret Santa after matching!")
                 await member.send(embed=embed)
                 dm_success += 1
@@ -1476,25 +1390,25 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="remove")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_remove(self, ctx, event_name: str, members: commands.Greedy[discord.Member]):
+    async def santa_remove(self, ctx, members: commands.Greedy[discord.Member]):
         """Remove participants from an existing event (before matching).
 
         Parameters
         ----------
-        event_name : str
-            Name of the event
         members : commands.Greedy[discord.Member]
             Members to remove from the event
 
-        Example: [p]santa remove xmas2024 @user1 @user2
+        Example: [p]santa remove @user1 @user2
         """
-        events = await self.config.guild(ctx.guild).events()
-
-        if event_name not in events:
-            await ctx.send(f"Event `{event_name}` not found.")
+        event = await self._get_event(ctx.guild)
+        
+        if not event:
+            await ctx.send(
+                "No Secret Santa event exists."
+            )
             return
-
-        if events[event_name]["matched"]:
+        
+        if event["matched"]:
             await ctx.send(
                 f"Cannot remove participants after matching. "
                 f"Use `{ctx.prefix}santa rematch` to reset matching first."
@@ -1508,14 +1422,14 @@ class SecretSanta(commands.Cog):
         removed = []
         not_in = []
 
-        async with self.config.guild(ctx.guild).events() as events:
-            for member in members:
-                user_id_str = str(member.id)
-                if user_id_str in events[event_name]["participants"]:
-                    del events[event_name]["participants"][user_id_str]
-                    removed.append(member.display_name)
-                else:
-                    not_in.append(member.display_name)
+        for member in members:
+            user_id_str = str(member.id)
+            if user_id_str in event["participants"]:
+                del event["participants"][user_id_str]
+                removed.append(member.display_name)
+            else:
+                not_in.append(member.display_name)
+        await self._save_event(ctx.guild, event)
 
         msg = ""
         if removed:
@@ -1525,35 +1439,35 @@ class SecretSanta(commands.Cog):
 
         await ctx.send(msg or "No changes made.")
 
-    # DM-only commands using event_id for anonymity
+    # DM-only commands for anonymity
     @commands.hybrid_group()
     @commands.dm_only()
     async def santadm(self, ctx):
         """Secret Santa DM commands for anonymous messaging.
 
         These commands can only be used in DMs with the bot to preserve anonymity.
-        Use the Event ID provided when you joined the event.
         """
 
     @santadm.command(name="message")
-    async def santadm_message(self, ctx, event_id: str, *, message: str):
+    async def santadm_message(self, ctx, *, message: str):
         """Send an anonymous message to your Secret Santa giftee (DM only).
 
         Your identity is kept secret - the bot relays the message.
-        Use the Event ID provided when you joined the event.
 
-        Example: [p]santadm message ABC12345 What's your favorite color?
+        Example: [p]santadm message What's your favorite color?
         """
-        result = await self._lookup_event_by_id(event_id.upper())
+        result = await self._get_user_event(
+            ctx.author.id
+        )
 
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
 
-        guild_id, event_name, event = result
+        guild_id, event = result
+        event_name = event["name"]
 
         if not event["matched"]:
             await ctx.send("This event hasn't been matched yet. Please wait for the matching to complete.")
@@ -1585,10 +1499,9 @@ class SecretSanta(commands.Cog):
             )
             embed.add_field(name="Event", value=event_name, inline=True)
             embed.add_field(name="Server", value=guild_name, inline=True)
-            embed.add_field(name="Event ID", value=f"`{event_id.upper()}`", inline=True)
             embed.add_field(
                 name="Reply",
-                value=f"Reply anonymously via DM: `{ctx.prefix}santadm reply {event_id.upper()} <message>`",
+                value=f"Reply anonymously via DM: `{ctx.prefix}santadm reply <message>`",
                 inline=False
             )
             embed.set_footer(text="This is from your Secret Santa! 🎁")
@@ -1600,24 +1513,25 @@ class SecretSanta(commands.Cog):
             await ctx.send("Could not send message to your giftee. They may have DMs disabled.")
 
     @santadm.command(name="reply")
-    async def santadm_reply(self, ctx, event_id: str, *, message: str):
+    async def santadm_reply(self, ctx, *, message: str):
         """Send an anonymous reply to your Secret Santa (DM only).
 
         This allows you to respond to questions from your Secret Santa.
-        Use the Event ID provided when you joined the event.
 
-        Example: [p]santadm reply ABC12345 My favorite color is blue!
+        Example: [p]santadm reply My favorite color is blue!
         """
-        result = await self._lookup_event_by_id(event_id.upper())
-
+        result = await self._get_user_event(
+            ctx.author.id
+        )
+        
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
-
-        guild_id, event_name, event = result
+        
+        guild_id, event = result
+        event_name = event["name"]
 
         if not event["matched"]:
             await ctx.send("This event hasn't been matched yet.")
@@ -1655,7 +1569,6 @@ class SecretSanta(commands.Cog):
             )
             embed.add_field(name="Event", value=event_name, inline=True)
             embed.add_field(name="Server", value=guild_name, inline=True)
-            embed.add_field(name="Event ID", value=f"`{event_id.upper()}`", inline=True)
             embed.set_footer(text="This is from the person you're buying a gift for! 🎄")
             await santa.send(embed=embed)
 
@@ -1665,24 +1578,26 @@ class SecretSanta(commands.Cog):
             await ctx.send("Could not send reply to your Secret Santa. They may have DMs disabled.")
 
     @santadm.command(name="wishlist")
-    async def santadm_wishlist(self, ctx, event_id: str, *, wishlist: str):
+    async def santadm_wishlist(self, ctx, *, wishlist: str):
         """Set your wishlist for a Secret Santa event (DM only).
 
         Your wishlist will be shared with your Secret Santa when matching occurs.
         If matching already happened, your Santa will be notified of the update.
 
-        Example: [p]santadm wishlist ABC12345 I'd love a book, some chocolates, or a cozy sweater!
+        Example: [p]santadm wishlist I'd love a book, some chocolates, or a cozy sweater!
         """
-        result = await self._lookup_event_by_id(event_id.upper())
-
+        result = await self._get_user_event(
+            ctx.author.id
+        )
+        
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
-
-        guild_id, event_name, event = result
+        
+        guild_id, event = result
+        event_name = event["name"]
 
         user_id_str = str(ctx.author.id)
         if user_id_str not in event["participants"]:
@@ -1690,8 +1605,8 @@ class SecretSanta(commands.Cog):
             return
 
         # Update the wishlist
-        async with self.config.guild_from_id(guild_id).events() as events:
-            events[event_name]["participants"][user_id_str]["wishlist"] = wishlist
+        event["participants"][user_id_str]["wishlist"] = wishlist
+        await self._save_event(guild_id, event)
 
         guild = self.bot.get_guild(guild_id)
         guild_name = guild.name if guild else "Unknown Server"
@@ -1735,23 +1650,25 @@ class SecretSanta(commands.Cog):
                         )
 
     @santadm.command(name="info")
-    async def santadm_info(self, ctx, event_id: str):
+    async def santadm_info(self, ctx):
         """Get information about your Secret Santa event (DM only).
 
         Shows your assignment, wishlist, and event details.
 
-        Example: [p]santadm info ABC12345
+        Example: [p]santadm info
         """
-        result = await self._lookup_event_by_id(event_id.upper())
-
+        result = await self._get_user_event(
+            ctx.author.id
+        )
+        
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
-
-        guild_id, event_name, event = result
+        
+        guild_id, event = result
+        event_name = event["name"]
 
         user_id_str = str(ctx.author.id)
         if user_id_str not in event["participants"]:
@@ -1768,7 +1685,6 @@ class SecretSanta(commands.Cog):
             description=f"Event **{event_name}** in **{guild_name}**",
             color=discord.Color.red()
         )
-        embed.add_field(name="Event ID", value=f"`{event_id.upper()}`", inline=True)
         embed.add_field(name="Target Date", value=event.get("target_date", "Not set"), inline=True)
         embed.add_field(name="Max Price", value=event.get("max_price", "Not set"), inline=True)
 
@@ -1808,7 +1724,7 @@ class SecretSanta(commands.Cog):
         else:
             embed.add_field(
                 name="📝 Your Wishlist",
-                value=f"Not set. Use `{ctx.prefix}santadm wishlist {event_id.upper()} <your wishlist>` to set it!",
+                value=f"Not set. Use `{ctx.prefix}santadm wishlist <your wishlist>` to set it!",
                 inline=False
             )
 
@@ -1827,59 +1743,57 @@ class SecretSanta(commands.Cog):
         await ctx.send(embed=embed)
 
     @santadm.command(name="sent")
-    async def santadm_sent(self, ctx, event_id: str):
+    async def santadm_sent(self, ctx):
         """Mark that you have sent your gift (DM only).
 
-        Use the Event ID provided when you joined the event.
-
-        Example: [p]santadm sent ABC12345
+        Example: [p]santadm sent
         """
-        result = await self._lookup_event_by_id(event_id.upper())
-
+        result = await self._get_user_event(
+            ctx.author.id
+        )
+        
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
-
-        guild_id, event_name, event = result
+        
+        guild_id, event = result
 
         user_id_str = str(ctx.author.id)
         if user_id_str not in event["participants"]:
             await ctx.send("You are not a participant in this event.")
             return
 
-        async with self.config.guild_from_id(guild_id).events() as events:
-            events[event_name]["participants"][user_id_str]["sent_gift"] = True
+        event["participants"][user_id_str]["sent_gift"] = True
+        await self._save_event(guild_id, event)
 
         await ctx.send("🎁 You've marked your gift as **sent**! Thank you!")
 
     @santadm.command(name="received")
-    async def santadm_received(self, ctx, event_id: str):
+    async def santadm_received(self, ctx):
         """Mark that you have received your gift (DM only).
 
-        Use the Event ID provided when you joined the event.
-
-        Example: [p]santadm received ABC12345
+        Example: [p]santadm received
         """
-        result = await self._lookup_event_by_id(event_id.upper())
-
+        result = await self._get_user_event(
+            ctx.author.id
+        )
+        
         if not result:
             await ctx.send(
-                f"Event with ID `{event_id}` not found. "
-                "Please check the Event ID from your Secret Santa notification."
+                "You are not participating in a Secret Santa event."
             )
             return
-
-        guild_id, event_name, event = result
+        
+        guild_id, event = result
 
         user_id_str = str(ctx.author.id)
         if user_id_str not in event["participants"]:
             await ctx.send("You are not a participant in this event.")
             return
 
-        async with self.config.guild_from_id(guild_id).events() as events:
-            events[event_name]["participants"][user_id_str]["received_gift"] = True
+        event["participants"][user_id_str]["received_gift"] = True
+        await self._save_event(guild_id, event)
 
         await ctx.send("🎄 You've marked your gift as **received**! Enjoy your present!")
