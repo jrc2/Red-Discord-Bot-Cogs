@@ -122,6 +122,7 @@ class SecretSanta(commands.Cog):
             return
 
         # Validate event ID is unique
+        event_id = event_id.upper()
         event_lookup = await self.config.event_lookup()
         if event_id in event_lookup:
             await ctx.send("Event ID already exists. Retry with a unique ID.")
@@ -332,6 +333,7 @@ class SecretSanta(commands.Cog):
             participant_data[str(giver_id)]["matched_to"] = receiver_id
 
         # Validate event ID is unique
+        event_id = event_id.upper()
         event_lookup = await self.config.event_lookup()
         if event_id in event_lookup:
             await ctx.send("Event ID already exists. Retry with a unique ID.")
