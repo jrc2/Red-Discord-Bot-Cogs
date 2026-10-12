@@ -63,14 +63,13 @@ class Emojify(commands.Cog):
                     "Usage: `!emojify christmas` or `!emojify 🌸 🌺 🌻`"
                 )
 
-        emoji = random.choice(emoji_list)
-
         await self.unemojify(ctx)
         
         done = 0
         failed = []
 
         for channel in ctx.guild.channels:
+            emoji = random.choice(emoji_list)
             new_name = f"{emoji}{channel.name}"
             if new_name == channel.name:
                 continue
