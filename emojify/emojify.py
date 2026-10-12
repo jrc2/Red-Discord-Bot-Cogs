@@ -7,7 +7,7 @@ import random
 class Emojify(commands.Cog):
     """Adds themed emojis to the front of all channel names."""
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
         self.presets = {
             "christmas": ["🎄", "🎅", "❄️", "🎁", "⛄", "🔔", "🕯️", "🧦", "🦌", "✨"],
