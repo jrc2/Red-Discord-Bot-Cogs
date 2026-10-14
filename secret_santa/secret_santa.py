@@ -1,7 +1,7 @@
 import datetime
 import logging
 import random
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import discord
 from redbot.core import Config, checks, commands
@@ -66,6 +66,32 @@ class SecretSanta(commands.Cog):
                 del event["participants"][user_id_str]
                 await self.config.guild_from_id(guild_id).event.set(event)
 
+    def _resolve_participants(
+        self,
+        participants: List[Union[discord.Member, discord.Role]]
+    ) -> List[discord.Member]:
+        """Resolve members and roles into a deduplicated member list."""
+
+        resolved = []
+
+        for item in participants:
+            if isinstance(item, discord.Role):
+                resolved.extend(
+                    member
+                    for member in item.members
+                    if not member.bot
+                )
+            elif (
+                isinstance(item, discord.Member)
+                and not item.bot
+            ):
+                resolved.append(item)
+
+        return list({
+            member.id: member
+            for member in resolved
+        }.values())
+
     @commands.hybrid_group()
     @commands.guild_only()
     async def santa(self, ctx):
@@ -79,7 +105,9 @@ class SecretSanta(commands.Cog):
         event_name: str,
         target_date: str,
         max_price: str,
-        participants: commands.Greedy[discord.Member]
+        participants: commands.Greedy[
+            Union[discord.Member, discord.Role]
+        ]
     ):
         """Create a new Secret Santa event.
 
@@ -87,9 +115,11 @@ class SecretSanta(commands.Cog):
         - event_name: A unique name for this event
         - target_date: The target date (YYYY-MM-DD format)
         - max_price: Maximum gift price (e.g., "$25" or "25 USD")
-        - participants: Mention all participants (at least 2 required)
+        - participants: Mention all participants and/or a role (at least 2 resolved participants required)
 
-        Example: [p]santa create xmas2024 2024-12-25 "$50" @user1 @user2 @user3
+        Example: [p]santa create xmas2026 2026-12-25 "$50" @SecretSanta
+                 [p]santa create xmas2026 2026-12-25 "$50" @John @Jane @Bob
+                 [p]santa create xmas2026 2026-12-25 "$50" @SecretSanta @John
         """
         # Validate date format
         try:
@@ -98,15 +128,11 @@ class SecretSanta(commands.Cog):
             await ctx.send("Invalid date format. Please use YYYY-MM-DD (e.g., 2024-12-25)")
             return
 
-        # Validate participants
-        if len(participants) < 2:
-            await ctx.send("You need at least 2 participants for a Secret Santa event.")
-            return
+        resolved_participants = self._resolve_participants(participants)
 
-        # Check for duplicate participants
-        unique_participants = set(p.id for p in participants)
-        if len(unique_participants) != len(participants):
-            await ctx.send("Duplicate participants detected. Each person can only participate once.")
+        # Validate participants
+        if len(resolved_participants) < 2:
+            await ctx.send("You need at least 2 participants for a Secret Santa event.")
             return
 
         # Check if an event already exists
@@ -120,7 +146,7 @@ class SecretSanta(commands.Cog):
 
         # Create participant data
         participant_data = {}
-        for member in participants:
+        for member in resolved_participants:
             participant_data[str(member.id)] = {
                 "matched_to": None,
                 "sent_gift": False,
@@ -146,7 +172,7 @@ class SecretSanta(commands.Cog):
         # Send DMs to participants asking for their wishlist
         dm_success = 0
         dm_failed = 0
-        for member in participants:
+        for member in resolved_participants:
             try:
                 embed = discord.Embed(
                     title="🎅 You've Been Added to a Secret Santa Event!",
@@ -181,7 +207,7 @@ class SecretSanta(commands.Cog):
             except discord.Forbidden:
                 dm_failed += 1
 
-        participant_names = ", ".join(p.display_name for p in participants)
+        participant_names = ", ".join(p.display_name for p in resolved_participants)
         embed = discord.Embed(
             title="🎅 Secret Santa Event Created!",
             description=f"Event **{event_name}** has been created.",
@@ -189,7 +215,7 @@ class SecretSanta(commands.Cog):
         )
         embed.add_field(name="Target Date", value=parsed_date.strftime("%B %d, %Y"), inline=True)
         embed.add_field(name="Max Price", value=max_price, inline=True)
-        embed.add_field(name="Participants", value=f"{len(participants)} people", inline=True)
+        embed.add_field(name="Participants", value=f"{len(resolved_participants)} people", inline=True)
         embed.add_field(name="DMs Sent", value=f"{dm_success} ✅ / {dm_failed} ❌", inline=True)
         embed.add_field(name="Participant List", value=participant_names, inline=False)
         embed.set_footer(
@@ -1289,15 +1315,21 @@ class SecretSanta(commands.Cog):
 
     @santa.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
-    async def santa_add(self, ctx, members: commands.Greedy[discord.Member]):
+    async def santa_add(
+        self, 
+        ctx, 
+        participants: commands.Greedy[
+            Union[discord.Member, discord.Role]
+        ]):
         """Add participants to an existing event (before matching).
 
         Parameters
         ----------
-        members : commands.Greedy[discord.Member]
-            Members to add to the event
+        participants : commands.Greedy[Union[discord.Member, discord.Role]]
+            Members and/or role containing members to add to the event
 
         Example: [p]santa add @user1 @user2
+                 [p]santa add @SecretSanta @user1
         """
         event = await self._get_event(ctx.guild)
         
@@ -1315,7 +1347,9 @@ class SecretSanta(commands.Cog):
             )
             return
 
-        if not members:
+        resolved_participants = self._resolve_participants(participants)
+
+        if not resolved_participants:
             await ctx.send("Please mention at least one member to add.")
             return
 
@@ -1326,7 +1360,7 @@ class SecretSanta(commands.Cog):
         already_in = []
         added_members = []
 
-        for member in members:
+        for member in resolved_participants:
             user_id_str = str(member.id)
             if user_id_str in event["participants"]:
                 already_in.append(member.display_name)
