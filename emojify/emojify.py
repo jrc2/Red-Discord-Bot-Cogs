@@ -10,8 +10,8 @@ class Emojify(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.presets = {
-            "christmas": ["🎄", "🎅", "❄️", "🎁", "⛄", "🔔", "🕯️", "🧦", "🦌", "✨"],
-            "halloween": ["🎃", "👻", "🕷️", "🕸️", "🦇", "🧛", "🌙", "🍬"],
+            "christmas": ["🎄", "🎅", "❄️", "🎁", "⛄", "🔔", "🕯️", "🧦", "🦌", "🌟", "🛷", "🎀"],
+            "halloween": ["🎃", "👻", "🕷️", "🕸️", "🦇", "🧛", "🌙", "🍬", "🧙", "🧹", "🐈‍⬛"],
         }
 
     def _is_emoji(self, text: str) -> bool:
