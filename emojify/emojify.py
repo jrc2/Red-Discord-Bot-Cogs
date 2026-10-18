@@ -15,12 +15,44 @@ class Emojify(commands.Cog):
         }
 
     def _is_emoji(self, text: str) -> bool:
+        """
+        Determine whether the provided text contains an emoji.
+
+        Parameters
+        ----------
+        text : str
+            The string to validate.
+
+        Returns
+        -------
+        bool
+            True if the string contains at least one emoji codepoint,
+            otherwise False.
+        """
         if not text:
             return False
 
         return bool(regex.search(r"\p{Emoji}", text))
 
     def _strip_leading_emoji(self, text: str) -> str:
+        """
+        Remove a leading emoji grapheme from a string.
+        
+        This is used to prevent channel names from accumulating multiple
+        emoji prefixes when emojify is run repeatedly.
+        
+        Parameters
+        ----------
+        text : str
+            The channel name to process.
+        
+        Returns
+        -------
+        str
+            The channel name with the first emoji grapheme removed if one
+            exists at the beginning of the name. Otherwise, the original
+            string is returned unchanged.
+        """
         if not text:
             return text
 
@@ -40,12 +72,30 @@ class Emojify(commands.Cog):
     @commands.has_permissions(manage_channels=True)
     @commands.command(name="emojify")
     async def emojify(self, ctx: commands.Context, preset_or_emoji: str, *rest: str):
-        """Remove existing leading emoji and then apply themed emojis to all channels.
+        """
+        Apply themed emoji prefixes to all channels in the server.
 
-        Usage:
-            !emojify christmas
-            !emojify halloween
-            !emojify 🌸 🌺 🌻 🌼 🌷
+        The command accepts either a built-in preset name or a custom list
+        of emojis. Existing leading emojis are removed before a new prefix
+        is applied. Each channel receives a randomly selected emoji from
+        the chosen set.
+
+        Use `--dry-run` to preview the changes without renaming channels.
+
+        Examples
+        --------
+        - [p]emojify christmas
+        - [p]emojify halloween
+        - [p]emojify 🌸 🌺 🌻
+        - [p]emojify christmas --dry-run
+
+        Parameters
+        ----------
+        preset_or_emoji : str
+            A preset name or the first emoji in a custom emoji list.
+
+        *rest : str
+            Additional emojis and optional command flags.
         """
         # Check if it's a preset name
         preset = self.presets.get(preset_or_emoji.lower())
@@ -111,7 +161,25 @@ class Emojify(commands.Cog):
     @commands.has_permissions(manage_channels=True)
     @commands.command(name="unemojify")
     async def unemojify(self, ctx: commands.Context, *args):
-        """Remove leading emoji prefixes from all channels (best-effort cleanup)."""
+        """
+        Remove leading emoji prefixes from all channel names.
+
+        Performs a best-effort cleanup by stripping the first emoji grapheme
+        from channel names. This restores channels renamed by the emojify
+        command.
+
+        Use `--dry-run` to preview the changes without modifying channels.
+
+        Examples
+        --------
+        - [p]unemojify
+        - [p]unemojify --dry-run
+
+        Parameters
+        ----------
+        *args : str
+            Optional command flags such as `--dry-run`.
+        """
         dry_run = "--dry-run" in args
         done = 0
         failed = []
